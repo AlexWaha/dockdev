@@ -1,10 +1,65 @@
 server {
     listen 80;
     server_name {{.Domain}};
-    root /var/www/html;
     index index.php index.html;
+    charset off;
+
+    set $root_path /var/www/html;
+    root $root_path;
+
+    client_max_body_size 108M;
+    access_log /var/log/nginx/{{.Prefix}}_access.log;
+    error_log  /var/log/nginx/{{.Prefix}}_error.log notice;
+
+    gzip on;
+    gzip_comp_level 5;
+    gzip_disable "msie6";
+    gzip_types
+        text/plain
+        text/css
+        application/json
+        application/javascript
+        application/x-javascript
+        text/javascript
+        text/xml
+        application/xml
+        application/xml+rss;
 
     location / {
-        try_files $uri $uri/ /index.php?$query_string;
+        try_files $uri $uri/ @rewrite;
+
+        location ~ [^/]\.ph(p\d*|tml)$ {
+            try_files /does_not_exist @php;
+        }
+
+        location ~* \.(avif|webp|jpg|jpeg|gif|png|svg|ico|mp4|webm|mkv|m4v|mp3|ogg|wav|aac|js|css|json|map|woff|woff2|ttf|otf|eot|zip|gz|bz2|rar|7z|tar)$ {
+            access_log off;
+            expires max;
+            break;
+        }
+    }
+
+    location @rewrite {
+        rewrite ^.*$ /index.php last;
+    }
+
+    location @php {
+        fastcgi_index index.php;
+        fastcgi_pass {{.Prefix}}_php:9000;
+        fastcgi_split_path_info ^((?U).+\.ph(?:p\d*|tml))(/?.+)$;
+        try_files $uri =404;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param PHP_VALUE "error_log=/var/log/nginx/{{.Prefix}}_php_error.log";
+    }
+
+    location = /robots.txt {
+        allow all;
+    }
+
+    location = /sitemap.xml {
+        allow all;
+        add_header Content-Type text/xml;
+        expires 1h;
     }
 }
