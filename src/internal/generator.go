@@ -3,18 +3,31 @@ package internal
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
+	"time"
 	"github.com/joho/godotenv"
 )
 
 type TemplateData struct {
-	Domain      string
-	Prefix      string
-	ProjectIP   string
-	NetworkName string
+	Domain       string
+	Prefix       string
+	NetworkName  string
+	IPsByService map[string]string
+}
+
+type SharedTemplateData struct {
+	NetworkName        string
+	ReverseProxyIP     string
+	SharedMySQLIP      string
+	MySQLRootPassword  string
+	MySQLUser          string
+	MySQLPassword      string
 }
 
 func GenerateProject(domain string) error {
@@ -24,16 +37,22 @@ func GenerateProject(domain string) error {
 
 	network := os.Getenv("NETWORK_NAME")
 	baseIP := os.Getenv("PROJECT_START_IP")
+	mysqlIP := os.Getenv("SHARED_MYSQL_IP")
 	ipmapPath := ".ipmap.env"
 	templateDir := "templates"
 	projectDir := filepath.Join("domains", domain)
 	prefix := strings.Split(domain, ".")[0]
 	hostsPath := "/mnt/c/Windows/System32/drivers/etc/hosts"
-	reverseProxyDir := "shared-services"
+	sharedServicesDir := "shared-services"
 	reverseProxyName := "nginx-reverse-proxy"
 
+	// Insert shared-mysql IP at the top
+	if mysqlIP != "" {
+		_ = InsertIPMappingAtTop(ipmapPath, "shared-mysql", mysqlIP)
+	}
+
 	if _, err := os.Stat(projectDir); !os.IsNotExist(err) {
-		return fmt.Errorf("project already exists: %s", projectDir)
+		return fmt.Errorf("Project already exists: %s", projectDir)
 	}
 	if err := os.MkdirAll(projectDir, 0755); err != nil {
 		return err
@@ -43,18 +62,36 @@ func GenerateProject(domain string) error {
 	if err != nil {
 		return err
 	}
-	projectIP, err := FindNextFreeIP(baseIP, usedIPs)
+
+	ipKeys, err := ExtractIPKeysFromTemplate(filepath.Join(templateDir, "docker-compose.yml.tmpl"))
 	if err != nil {
 		return err
 	}
-	if err := AppendIPMapping(ipmapPath, domain, projectIP); err != nil {
-		return err
+
+	ipMap := map[string]string{}
+
+	for _, key := range ipKeys {
+		ip, err := FindNextFreeIP(baseIP, usedIPs)
+		if err != nil {
+			return err
+		}
+		usedIPs[ip] = true
+		ipMap[key] = ip
+
+		entry := domain
+		if key != "main" {
+			entry += "_" + key
+		}
+		if err := AppendIPMapping(ipmapPath, entry, ip); err != nil {
+			return err
+		}
 	}
 
 	data := TemplateData{
-		Domain: domain, Prefix: prefix, ProjectIP: projectIP, NetworkName: network,
+		Domain: domain, Prefix: prefix, NetworkName: network, IPsByService: ipMap,
 	}
 
+	// docker-compose.yml
 	if err := RenderTemplate(
 		filepath.Join(templateDir, "docker-compose.yml.tmpl"),
 		filepath.Join(projectDir, "docker-compose.yml"),
@@ -63,10 +100,23 @@ func GenerateProject(domain string) error {
 		return err
 	}
 
+	// image/, conf/, logs/, data/
+	for _, dir := range []string{"image", "conf", "logs", "data"} {
+		src := filepath.Join(templateDir, dir)
+		dst := filepath.Join(projectDir, dir)
+		if _, err := os.Stat(src); err == nil {
+			if err := CopyDir(src, dst); err != nil {
+				return fmt.Errorf("Failed to copy %s: %w", dir, err)
+			}
+		}
+	}
+
+	// conf/nginx/default.conf
 	confDir := filepath.Join(projectDir, "conf", "nginx")
 	if err := os.MkdirAll(confDir, 0755); err != nil {
 		return err
 	}
+
 	if err := RenderTemplate(
 		filepath.Join(templateDir, "nginx.conf.tmpl"),
 		filepath.Join(confDir, "default.conf"),
@@ -75,10 +125,12 @@ func GenerateProject(domain string) error {
 		return err
 	}
 
+	// app/index.html
 	appDstDir := filepath.Join(projectDir, "app")
 	if err := os.MkdirAll(appDstDir, 0755); err != nil {
 		return err
 	}
+
 	if err := RenderTemplate(
 		filepath.Join(templateDir, "app", "index.html"),
 		filepath.Join(appDstDir, "index.html"),
@@ -87,10 +139,49 @@ func GenerateProject(domain string) error {
 		return err
 	}
 
-	sitesDir := filepath.Join(reverseProxyDir, "sites")
+	// shared-services/sites/domain.conf
+	sitesDir := filepath.Join(sharedServicesDir, "sites")
 	if err := os.MkdirAll(sitesDir, 0755); err != nil {
 		return err
 	}
+
+	// Generate shared-services/docker-compose.yml if it doesn't exist
+	sharedComposeTemplate := filepath.Join(templateDir, sharedServicesDir, "docker-compose.yml.tmpl")
+	sharedComposePath := filepath.Join(sharedServicesDir, "docker-compose.yml")
+	if _, err := os.Stat(sharedComposePath); os.IsNotExist(err) {
+		sharedTemplate := SharedTemplateData{
+			NetworkName:        network,
+			ReverseProxyIP:     os.Getenv("REVERSE_PROXY_IP"),
+			SharedMySQLIP:      os.Getenv("SHARED_MYSQL_IP"),
+			MySQLRootPassword:  os.Getenv("MYSQL_ROOT_PASSWORD"),
+			MySQLUser:          os.Getenv("MYSQL_USER"),
+			MySQLPassword:      os.Getenv("MYSQL_PASSWORD"),
+		}
+
+		if err := RenderTemplate(sharedComposeTemplate, sharedComposePath, sharedTemplate); err != nil {
+			return fmt.Errorf("Failed to render shared-services/docker-compose.yml: %w", err)
+		}
+		
+		fmt.Println("Generated shared-services/docker-compose.yml")
+	}
+
+	// Render shared-services/nginx.conf
+	nginxConfTemplate := filepath.Join(templateDir, sharedServicesDir, "nginx.conf.tmpl")
+	nginxConfDest := filepath.Join(sharedServicesDir, "nginx.conf")
+	if err := RenderTemplate(nginxConfTemplate, nginxConfDest, data); err != nil {
+		return fmt.Errorf("Failed to render nginx.conf: %w", err)
+	}
+	fmt.Println("Generated reverse proxy nginx.conf")
+
+	// Copy shared-services/image if it exists
+	sharedImageSrc := filepath.Join(templateDir, sharedServicesDir, "image")
+	sharedImageDst := filepath.Join(sharedServicesDir, "image")
+	if _, err := os.Stat(sharedImageSrc); err == nil {
+		if err := CopyDir(sharedImageSrc, sharedImageDst); err != nil {
+			return fmt.Errorf("Failed to copy shared-services image: %w", err)
+		}
+	}
+
 	siteConf := filepath.Join(sitesDir, domain+".conf")
 	if _, err := os.Stat(siteConf); os.IsNotExist(err) {
 		if err := RenderTemplate(
@@ -100,14 +191,26 @@ func GenerateProject(domain string) error {
 		); err != nil {
 			return err
 		}
+		
 		fmt.Println("Created reverse proxy config:", siteConf)
-	} else {
-		fmt.Println("Reverse proxy config already exists:", siteConf)
 	}
 
 	fmt.Println("Starting shared-services...")
-	if err := runDockerComposeUp(reverseProxyDir); err != nil {
+	if err := runDockerComposeUp(sharedServicesDir); err != nil {
 		return err
+	}
+
+	root := os.Getenv("MYSQL_ROOT_PASSWORD")
+	user := os.Getenv("MYSQL_USER")
+
+	fmt.Println("Waiting for MySQL to become ready...")
+	if err := waitForMySQL("shared_mysql", root); err != nil {
+		return err
+	}
+
+	fmt.Println("Granting privileges to user...")
+	if err := grantAllPrivileges("shared_mysql", root, user); err != nil {
+		return fmt.Errorf("Failed to grant privileges: %w", err)
 	}
 
 	fmt.Println("Starting project containers...")
@@ -121,7 +224,7 @@ func GenerateProject(domain string) error {
 		fmt.Println("Reload failed, restarting container...")
 		err = exec.Command("docker", "restart", reverseProxyName).Run()
 		if err != nil {
-			return fmt.Errorf("failed to reload or restart reverse proxy: %w", err)
+			return fmt.Errorf("Failed to reload or restart reverse proxy: %w", err)
 		}
 	}
 
@@ -132,7 +235,88 @@ func GenerateProject(domain string) error {
 	return nil
 }
 
+func InsertIPMappingAtTop(filePath, key, ip string) error {
+	entry := fmt.Sprintf("%s=%s", key, ip)
+
+	content, err := os.ReadFile(filePath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	lines := strings.Split(string(content), "\n")
+
+	var filtered []string
+	for _, line := range lines {
+		if !strings.HasPrefix(line, key+"=") && strings.TrimSpace(line) != "" {
+			filtered = append(filtered, line)
+		}
+	}
+
+	final := append([]string{entry}, filtered...)
+	return os.WriteFile(filePath, []byte(strings.Join(final, "\n")+"\n"), 0644)
+}
+
+func ExtractIPKeysFromTemplate(path string) ([]string, error) {
+	content, err := os.ReadFile(path)
+
+	if err != nil {
+		return nil, err
+	}
+
+	regex := regexp.MustCompile(`{{\s*index\s+\.IPsByService\s+"([^"]+)"\s*}}`)
+	matches := regex.FindAllStringSubmatch(string(content), -1)
+
+	set := make(map[string]bool)
+	for _, m := range matches {
+		set[m[1]] = true
+	}
+
+	keys := make([]string, 0, len(set))
+
+	for k := range set {
+		keys = append(keys, k)
+	}
+
+	sort.Strings(keys)
+	return keys, nil
+}
+
+func CopyDir(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+
+		srcFile, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+
+		defer srcFile.Close()
+		dstFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, info.Mode())
+		if err != nil {
+			return err
+		}
+
+		defer dstFile.Close()
+		_, err = io.Copy(dstFile, srcFile)
+		return err
+	})
+}
+
 func DeleteProject(domain string) {
+	sharedServicesDir := "shared-services"
+	
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Printf("Are you sure you want to delete domain '%s'? [y/N]: ", domain)
 	answer, _ := reader.ReadString('\n')
@@ -156,10 +340,21 @@ func DeleteProject(domain string) {
 		}
 	}
 
-	if err := os.RemoveAll(projectPath); err != nil {
-		fmt.Println("Failed to remove domain folder:", err)
+	err := os.RemoveAll(projectPath)
+	if err != nil {
+		fmt.Println("Remove Domain failed, retrying with sudo rm -rf")
+
+		cmd := exec.Command("sudo", "rm", "-rf", projectPath)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Run(); err != nil {
+			fmt.Println("Hard delete failed (sudo):", err)
+		} else {
+			fmt.Println("Deleted folder with sudo rm -rf:", projectPath)
+		}
 	} else {
-		fmt.Println("Deleted folder:", projectPath)
+		fmt.Println("Deleted domain folder:", projectPath)
 	}
 
 	ipmap := ".ipmap.env"
@@ -167,7 +362,7 @@ func DeleteProject(domain string) {
 	if err == nil {
 		var kept []string
 		for _, line := range strings.Split(string(lines), "\n") {
-			if !strings.HasPrefix(line, domain+"=") {
+			if !strings.HasPrefix(line, domain+"=") && !strings.HasPrefix(line, domain+"_") {
 				kept = append(kept, line)
 			}
 		}
@@ -175,7 +370,7 @@ func DeleteProject(domain string) {
 		fmt.Println("Updated:", ipmap)
 	}
 
-	sitePath := filepath.Join("shared-services", "sites", domain+".conf")
+	sitePath := filepath.Join(sharedServicesDir, "sites", domain+".conf")
 	if err := os.Remove(sitePath); err == nil {
 		fmt.Println("Removed reverse proxy config:", sitePath)
 	}
@@ -204,6 +399,31 @@ func runDockerComposeUp(dir string) error {
 	return cmd.Run()
 }
 
+func waitForMySQL(container, rootPass string) error {
+	for i := 1; i <= 30; i++ {
+		cmd := exec.Command("docker", "exec", container,
+			"mysql", "-uroot", fmt.Sprintf("-p%s", rootPass),
+			"-e", "SELECT 1;")
+
+		if err := cmd.Run(); err == nil {
+			fmt.Println("MySQL is ready.")
+			return nil
+		}
+
+		fmt.Printf("Waiting for MySQL... (%d/30)\n", i)
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("MySQL is not responding in container: %s", container)
+}
+
+func grantAllPrivileges(container, rootPass, user string) error {
+	sql := fmt.Sprintf(`GRANT ALL PRIVILEGES ON *.* TO '%s'@'%%' WITH GRANT OPTION;`, user)
+	cmd := exec.Command("docker", "exec", "-i", container, "mysql", "-uroot", fmt.Sprintf("-p%s", rootPass), "-e", sql)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 func updateWindowsHosts(domain, path string) error {
 	hostsEntry := fmt.Sprintf("127.0.0.1 %s", domain)
 
@@ -211,6 +431,7 @@ func updateWindowsHosts(domain, path string) error {
 	if err != nil {
 		return err
 	}
+
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)

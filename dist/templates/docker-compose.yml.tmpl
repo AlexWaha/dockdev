@@ -7,7 +7,56 @@ services:
       - ./app:/var/www/html:ro
     networks:
       {{.NetworkName}}:
-        ipv4_address: {{.ProjectIP}}
+        ipv4_address: {{ index .IPsByService "main" }}
+
+  php:
+    container_name: {{.Prefix}}_php
+    build:
+      context: ./image/php/
+      dockerfile: Dockerfile
+    entrypoint: ["/usr/local/bin/php-entrypoint.sh"]
+    volumes:
+      - ./app:/var/www/html:rw
+      - ./conf/php/www.conf:/usr/local/etc/php-fpm.d/www.conf
+      - ./conf/php/pcov.ini:/usr/local/etc/php/conf.d/pcov.ini
+    restart: unless-stopped
+    networks:
+      {{.NetworkName}}:
+        ipv4_address: {{ index .IPsByService "php" }}
+
+  redis:
+    container_name: {{.Prefix}}_redis
+    image: redis:7.4.3-bookworm
+    volumes:
+      - ./logs/redis:/var/log:rw
+      - ./data/redis:/data:rw
+    restart: unless-stopped
+    networks:
+      {{.NetworkName}}:
+        ipv4_address: {{ index .IPsByService "redis" }}
+
+  elasticmq:
+    container_name: {{.Prefix}}_elasticmq
+    image: softwaremill/elasticmq
+    volumes:
+      - ./data/elasticmq:/data:rw
+    restart: unless-stopped
+    networks:
+      {{.NetworkName}}:
+        ipv4_address: {{ index .IPsByService "elasticmq" }}
+
+  node:
+    container_name: {{.Prefix}}_node
+    build:
+      context: ./image/node/
+      dockerfile: Dockerfile
+    entrypoint: ["/usr/local/bin/node-entrypoint.sh"]
+    tty: true
+    volumes:
+      - ./app:/var/www/html:rw
+    networks:
+      {{.NetworkName}}:
+        ipv4_address: {{ index .IPsByService "node" }}
 
 networks:
   {{.NetworkName}}:

@@ -58,7 +58,6 @@ Run `build.bat`
 - `.env`
 - `dockdev`
 - `templates`
-- `shared-services`
 
 ---
 ## 💡 Before you start!
@@ -93,6 +92,7 @@ Run `build.bat`
 
 - Create `domains/app.local/`
 - Assign next free IP like `10.0.100.12`
+- Assign IP's for all project containers
 - Generate:
   - `docker-compose.yml`
   - `conf/nginx/default.conf`
@@ -132,9 +132,9 @@ Deletes:
 - 🔧 `dockdev`: CLI manager (Go)
 - 📁 `templates/`: reusable template files 
 > You can extend docker-compose.yml.tmpl with your containers
-- 🌍 `shared-services/`: reverse proxy & global services (Mysql)
+- 🌍 `shared-services/`: reverse proxy & shared Mysql DB
 - 🛠 `.ipmap.env`
->📘 Reference file for developers, to track which domain was assigned to which IP
+>📘 Reference file for developers, to track which containers was assigned to which IP
 - 🔌 All containers in one shared Docker `bridge` network
 
 ---
