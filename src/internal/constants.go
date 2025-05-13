@@ -43,4 +43,11 @@ const (
 	ReservedIPGateway    = 1  // Default gateway
 	ReservedIPBroadcast1 = 254 // Broadcast address (for some networks)
 	ReservedIPBroadcast2 = 255 // Broadcast address
+)
+
+// Feature flags
+const (
+	// SSLEnabled controls whether SSL is enabled for projects
+	// Currently, this must be true as SSL is required for the application to work
+	SSLEnabled = true
 ) 

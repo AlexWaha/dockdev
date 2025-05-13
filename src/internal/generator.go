@@ -13,6 +13,7 @@ type TemplateData struct {
 	Prefix       string
 	NetworkName  string
 	IPsByService map[string]string
+	UseSSL       bool
 }
 
 type SharedTemplateData struct {
@@ -24,7 +25,31 @@ type SharedTemplateData struct {
 	MySQLPassword      string
 }
 
-func GenerateProject(domain string) error {
+// GenerateProject creates a new project with the given domain name
+// The useSSL parameter controls whether SSL is enabled for the project
+// Currently, SSL is required for the application to work correctly
+func GenerateProject(domain string, useSSL ...bool) error {
+	// Ensure Docker is running before proceeding
+	if err := EnsureDockerRunning(); err != nil {
+		return fmt.Errorf("Docker check failed: %w", err)
+	}
+
+	// Default to SSL enabled
+	enableSSL := true
+	
+	// If useSSL parameter is provided, use it
+	if len(useSSL) > 0 {
+		enableSSL = useSSL[0]
+	}
+	
+	// For now, we require SSL to be enabled
+	if !enableSSL {
+		enableSSL = SSLEnabled
+		if enableSSL {
+			fmt.Println("Warning: SSL is currently required for projects. Your selection to disable SSL was ignored.")
+		}
+	}
+
 	if err := godotenv.Load(".env"); err != nil {
 		return fmt.Errorf("error loading .env file: %w", err)
 	}
@@ -76,22 +101,28 @@ func GenerateProject(domain string) error {
 	}
 
 	data := TemplateData{
-		Domain: domain, Prefix: prefix, NetworkName: network, IPsByService: ipMap,
+		Domain: domain, 
+		Prefix: prefix, 
+		NetworkName: network, 
+		IPsByService: ipMap,
+		UseSSL: enableSSL,
 	}
 
-	if err := ensureRootCA(CertsDir); err != nil {
-		return fmt.Errorf("SSL rootCA failed: %w", err)
-	}
+	if enableSSL {
+		if err := ensureRootCA(CertsDir); err != nil {
+			return fmt.Errorf("SSL rootCA failed: %w", err)
+		}
 
-	crtPath, keyPath, err := generateDomainCert(domain, CertsDir)
-	if err != nil {
-		return fmt.Errorf("Domain SSL generation failed: %w", err)
-	}
+		crtPath, keyPath, err := generateDomainCert(domain, CertsDir)
+		if err != nil {
+			return fmt.Errorf("Domain SSL generation failed: %w", err)
+		}
 
-	// Copy certificates to project's nginx ssl directory
-	sslDstDir := filepath.Join(projectDir, "conf", "nginx", "ssl")
-	if err := CopyCertificates(crtPath, keyPath, sslDstDir); err != nil {
-		return err
+		// Copy certificates to project's nginx ssl directory
+		sslDstDir := filepath.Join(projectDir, "conf", "nginx", "ssl")
+		if err := CopyCertificates(crtPath, keyPath, sslDstDir); err != nil {
+			return err
+		}
 	}
 
 	// Render docker-compose.yml from template
