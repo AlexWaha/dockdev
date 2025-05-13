@@ -3,7 +3,6 @@ package internal
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"github.com/joho/godotenv"
@@ -30,34 +29,29 @@ func GenerateProject(domain string) error {
 		return fmt.Errorf("error loading .env file: %w", err)
 	}
 
-	network := os.Getenv("NETWORK_NAME")
-	baseIP := os.Getenv("PROJECT_START_IP")
-	mysqlIP := os.Getenv("SHARED_MYSQL_IP")
-	ipmapPath := ".ipmap.env"
-	templateDir := "templates"
-	projectDir := filepath.Join("domains", domain)
+	network := os.Getenv(EnvNetworkName)
+	baseIP := os.Getenv(EnvProjectStartIP)
+	mysqlIP := os.Getenv(EnvSharedMySQLIP)
+	projectDir := filepath.Join(ProjectDirPrefix, domain)
 	prefix := strings.Split(domain, ".")[0]
-	hostsPath := "/mnt/c/Windows/System32/drivers/etc/hosts"
-	sharedServicesDir := "shared-services"
-	reverseProxyName := "nginx-reverse-proxy"
 
 	if mysqlIP != "" {
-		_ = InsertIPMappingAtTop(ipmapPath, "shared-mysql", mysqlIP)
+		_ = InsertIPMappingAtTop(IPMapPath, "shared-mysql", mysqlIP)
 	}
 
 	if _, err := os.Stat(projectDir); !os.IsNotExist(err) {
 		return fmt.Errorf("Project already exists: %s", projectDir)
 	}
-	if err := os.MkdirAll(projectDir, 0755); err != nil {
-		return err
+	if err := CreateDirIfNotExist(projectDir); err != nil {
+		return fmt.Errorf("failed to create project directory: %w", err)
 	}
 
-	usedIPs, err := LoadUsedIPs(ipmapPath)
+	usedIPs, err := LoadUsedIPs(IPMapPath)
 	if err != nil {
 		return err
 	}
 
-	ipKeys, err := ExtractIPKeysFromTemplate(filepath.Join(templateDir, "docker-compose.yml.tmpl"))
+	ipKeys, err := ExtractIPKeysFromTemplate(filepath.Join(TemplateDir, DockerComposeFile+".tmpl"))
 	if err != nil {
 		return err
 	}
@@ -76,7 +70,7 @@ func GenerateProject(domain string) error {
 		if key != "main" {
 			entry += "_" + key
 		}
-		if err := AppendIPMapping(ipmapPath, entry, ip); err != nil {
+		if err := AppendIPMapping(IPMapPath, entry, ip); err != nil {
 			return err
 		}
 	}
@@ -85,116 +79,111 @@ func GenerateProject(domain string) error {
 		Domain: domain, Prefix: prefix, NetworkName: network, IPsByService: ipMap,
 	}
 
-	certsDir := filepath.Join("shared-services", "certs")
-	if err := ensureRootCA(certsDir); err != nil {
+	if err := ensureRootCA(CertsDir); err != nil {
 		return fmt.Errorf("SSL rootCA failed: %w", err)
 	}
 
-	crtPath, keyPath, err := generateDomainCert(domain, certsDir)
+	crtPath, keyPath, err := generateDomainCert(domain, CertsDir)
 	if err != nil {
 		return fmt.Errorf("Domain SSL generation failed: %w", err)
 	}
 
-	// conf/nginx/ssl
+	// Copy certificates to project's nginx ssl directory
 	sslDstDir := filepath.Join(projectDir, "conf", "nginx", "ssl")
-	os.MkdirAll(sslDstDir, 0755)
-	copy(crtPath, filepath.Join(sslDstDir, "cert.crt"))
-	copy(keyPath, filepath.Join(sslDstDir, "cert.key"))
+	if err := CopyCertificates(crtPath, keyPath, sslDstDir); err != nil {
+		return err
+	}
 
-	// docker-compose.yml
+	// Render docker-compose.yml from template
 	if err := RenderTemplate(
-		filepath.Join(templateDir, "docker-compose.yml.tmpl"),
-		filepath.Join(projectDir, "docker-compose.yml"),
+		filepath.Join(TemplateDir, DockerComposeFile+".tmpl"),
+		filepath.Join(projectDir, DockerComposeFile),
 		data,
 	); err != nil {
 		return err
 	}
 
-	for _, dir := range []string{"image", "conf", "logs", "data"} {
-		src := filepath.Join(templateDir, dir)
-		dst := filepath.Join(projectDir, dir)
-		if _, err := os.Stat(src); err == nil {
-			if err := CopyDir(src, dst); err != nil {
-				return fmt.Errorf("Failed to copy %s: %w", dir, err)
-			}
-		}
-	}
-
-	// conf/nginx/default.conf
-	confDir := filepath.Join(projectDir, "conf", "nginx")
-	if err := os.MkdirAll(confDir, 0755); err != nil {
+	// Copy all required directories from template to project
+	if err := CopyTemplatedDirectories(TemplateDir, projectDir, ProjectFolders); err != nil {
 		return err
 	}
 
+	// Create and render nginx config
+	confDir := filepath.Join(projectDir, "conf", "nginx")
+	if err := CreateDirIfNotExist(confDir); err != nil {
+		return fmt.Errorf("failed to create nginx config directory: %w", err)
+	}
+
 	if err := RenderTemplate(
-		filepath.Join(templateDir, "nginx.conf.tmpl"),
+		filepath.Join(TemplateDir, "nginx.conf.tmpl"),
 		filepath.Join(confDir, "default.conf"),
 		data,
 	); err != nil {
 		return err
 	}
 
-	// app/index.html
+	// Create and render app/index.html
 	appDstDir := filepath.Join(projectDir, "app")
-	if err := os.MkdirAll(appDstDir, 0755); err != nil {
-		return err
+	if err := CreateDirIfNotExist(appDstDir); err != nil {
+		return fmt.Errorf("failed to create app directory: %w", err)
 	}
 
 	if err := RenderTemplate(
-		filepath.Join(templateDir, "app", "index.html"),
+		filepath.Join(TemplateDir, "app", "index.html"),
 		filepath.Join(appDstDir, "index.html"),
 		data,
 	); err != nil {
 		return err
 	}
 
-	// shared-services/sites/domain.conf
-	sitesDir := filepath.Join(sharedServicesDir, "sites")
-	if err := os.MkdirAll(sitesDir, 0755); err != nil {
-		return err
+	// Create and configure shared services
+	sitesDir := filepath.Join(SharedServicesDir, SitesDir)
+	if err := CreateDirIfNotExist(sitesDir); err != nil {
+		return fmt.Errorf("failed to create sites directory: %w", err)
 	}
 
 	// Generate shared-services/docker-compose.yml if it doesn't exist
-	sharedComposeTemplate := filepath.Join(templateDir, sharedServicesDir, "docker-compose.yml.tmpl")
-	sharedComposePath := filepath.Join(sharedServicesDir, "docker-compose.yml")
+	sharedComposeTemplate := filepath.Join(TemplateDir, SharedServicesDir, DockerComposeFile+".tmpl")
+	sharedComposePath := filepath.Join(SharedServicesDir, DockerComposeFile)
 	if _, err := os.Stat(sharedComposePath); os.IsNotExist(err) {
 		sharedTemplate := SharedTemplateData{
 			NetworkName:        network,
-			ReverseProxyIP:     os.Getenv("REVERSE_PROXY_IP"),
-			SharedMySQLIP:      os.Getenv("SHARED_MYSQL_IP"),
-			MySQLRootPassword:  os.Getenv("MYSQL_ROOT_PASSWORD"),
-			MySQLUser:          os.Getenv("MYSQL_USER"),
-			MySQLPassword:      os.Getenv("MYSQL_PASSWORD"),
+			ReverseProxyIP:     os.Getenv(EnvReverseProxyIP),
+			SharedMySQLIP:      os.Getenv(EnvSharedMySQLIP),
+			MySQLRootPassword:  os.Getenv(EnvMySQLRootPassword),
+			MySQLUser:          os.Getenv(EnvMySQLUser),
+			MySQLPassword:      os.Getenv(EnvMySQLPassword),
 		}
 
 		if err := RenderTemplate(sharedComposeTemplate, sharedComposePath, sharedTemplate); err != nil {
-			return fmt.Errorf("Failed to render shared-services/docker-compose.yml: %w", err)
+			return fmt.Errorf("Failed to render %s: %w", filepath.Join(SharedServicesDir, DockerComposeFile), err)
 		}
 
-		fmt.Println("Generated shared-services/docker-compose.yml")
+		fmt.Println("Generated " + filepath.Join(SharedServicesDir, DockerComposeFile))
 	}
 
 	// Render shared-services/nginx.conf
-	nginxConfTemplate := filepath.Join(templateDir, sharedServicesDir, "nginx.conf.tmpl")
-	nginxConfDest := filepath.Join(sharedServicesDir, "nginx.conf")
+	nginxConfTemplate := filepath.Join(TemplateDir, SharedServicesDir, NginxConfFileName+".tmpl")
+	nginxConfDest := filepath.Join(SharedServicesDir, NginxConfFileName)
 	if err := RenderTemplate(nginxConfTemplate, nginxConfDest, data); err != nil {
 		return fmt.Errorf("Failed to render nginx.conf: %w", err)
 	}
 	fmt.Println("Generated reverse proxy nginx.conf")
 
 	// Copy shared-services/image if it exists
-	sharedImageSrc := filepath.Join(templateDir, sharedServicesDir, "image")
-	sharedImageDst := filepath.Join(sharedServicesDir, "image")
+	sharedImageSrc := filepath.Join(TemplateDir, SharedServicesDir, "image")
+	sharedImageDst := filepath.Join(SharedServicesDir, "image")
 	if _, err := os.Stat(sharedImageSrc); err == nil {
 		if err := CopyDir(sharedImageSrc, sharedImageDst); err != nil {
 			return fmt.Errorf("Failed to copy shared-services image: %w", err)
 		}
 	}
 
+	// Create site configuration
 	siteConf := filepath.Join(sitesDir, domain+".conf")
 	if _, err := os.Stat(siteConf); os.IsNotExist(err) {
 		if err := RenderTemplate(
-			filepath.Join(templateDir, "site.conf.tmpl"),
+			filepath.Join(TemplateDir, "site.conf.tmpl"),
 			siteConf,
 			data,
 		); err != nil {
@@ -205,20 +194,20 @@ func GenerateProject(domain string) error {
 	}
 
 	fmt.Println("Starting shared-services...")
-	if err := runDockerComposeUp(sharedServicesDir); err != nil {
+	if err := runDockerComposeUp(SharedServicesDir); err != nil {
 		return err
 	}
 
-	root := os.Getenv("MYSQL_ROOT_PASSWORD")
-	user := os.Getenv("MYSQL_USER")
+	root := os.Getenv(EnvMySQLRootPassword)
+	user := os.Getenv(EnvMySQLUser)
 
 	fmt.Println("Waiting for MySQL to become ready...")
-	if err := waitForMySQL("shared_mysql", root); err != nil {
+	if err := waitForMySQL(SharedMySQLName, root); err != nil {
 		return err
 	}
 
 	fmt.Println("Granting privileges to user...")
-	if err := grantAllPrivileges("shared_mysql", root, user); err != nil {
+	if err := grantAllPrivileges(SharedMySQLName, root, user); err != nil {
 		return fmt.Errorf("Failed to grant privileges: %w", err)
 	}
 
@@ -227,17 +216,12 @@ func GenerateProject(domain string) error {
 		return err
 	}
 
-	fmt.Println("Reloading reverse proxy config...")
-	err = exec.Command("docker", "exec", reverseProxyName, "nginx", "-s", "reload").Run()
-	if err != nil {
-		fmt.Println("Reload failed, restarting container...")
-		err = exec.Command("docker", "restart", reverseProxyName).Run()
-		if err != nil {
-			return fmt.Errorf("Failed to reload or restart reverse proxy: %w", err)
-		}
+	// Reload or restart the Nginx reverse proxy
+	if err := restartNginxReverseProxy(); err != nil {
+		return err
 	}
 
-	if err := updateWindowsHosts(domain, hostsPath); err != nil {
+	if err := updateWindowsHosts(domain, WindowsHostsPath); err != nil {
 		return err
 	}
 

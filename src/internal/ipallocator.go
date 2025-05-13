@@ -32,11 +32,29 @@ func LoadUsedIPs(ipmapPath string) (map[string]bool, error) {
 	return used, scanner.Err()
 }
 
+// isReservedIPSuffix checks if the IP last octet is reserved
+func isReservedIPSuffix(octet int) bool {
+	return octet == ReservedIPNetwork || 
+	       octet == ReservedIPGateway || 
+	       octet == ReservedIPBroadcast1 || 
+	       octet == ReservedIPBroadcast2
+}
+
 func FindNextFreeIP(base string, used map[string]bool) (string, error) {
 	prefix := base[:strings.LastIndex(base, ".")]
 	start, _ := strconv.Atoi(base[strings.LastIndex(base, ".")+1:])
 
-	for i := start; i < 255; i++ {
+	// Ensure start is at least 2 to avoid .0 and .1
+	if start < 2 {
+		start = 2
+	}
+
+	for i := start; i < 254; i++ {
+		// Skip reserved IP suffixes
+		if isReservedIPSuffix(i) {
+			continue
+		}
+		
 		candidate := fmt.Sprintf("%s.%d", prefix, i)
 		if !used[candidate] {
 			return candidate, nil

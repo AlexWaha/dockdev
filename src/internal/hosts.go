@@ -32,3 +32,25 @@ func updateWindowsHosts(domain, path string) error {
 	fmt.Println("Domain added to Windows hosts file.")
 	return nil
 }
+
+func removeFromWindowsHosts(domain, path string) error {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	var lines []string
+	for _, line := range strings.Split(string(content), "\n") {
+		if !strings.Contains(line, domain) {
+			lines = append(lines, line)
+		}
+	}
+	
+	err = os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
+	if err != nil {
+		return err
+	}
+	
+	fmt.Println("Domain removed from Windows hosts file.")
+	return nil
+}

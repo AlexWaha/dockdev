@@ -11,7 +11,6 @@ func ensureRootCA(certsDir string) error {
 	rootKey := filepath.Join(certsDir, "rootCA.key")
 	rootPem := filepath.Join(certsDir, "rootCA.pem")
 
-	// Если уже есть — пропускаем
 	if _, err := os.Stat(rootPem); err == nil {
 		return nil
 	}
@@ -35,13 +34,21 @@ func ensureRootCA(certsDir string) error {
 	}
 
 	fmt.Println("Importing rootCA.pem into Windows trusted store...")
-	importCmd := exec.Command("powershell.exe", "-Command",
-		fmt.Sprintf(`Start-Process powershell -Verb runAs -ArgumentList 'certutil -addstore -f Root "%s"'`,
+	// Use -NoProfile and -ExecutionPolicy Bypass to reduce memory usage and ensure clean exit
+	importCmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+		fmt.Sprintf(`Start-Process powershell -Verb runAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','certutil -addstore -f Root "%s"; exit'`,
 			convertToWindowsPath(rootPem)))
 	importCmd.Stdin = os.Stdin
 	importCmd.Stdout = os.Stdout
 	importCmd.Stderr = os.Stderr
-	return importCmd.Run()
+	err := importCmd.Run()
+	
+	// Force garbage collection for PowerShell process
+	if importCmd.Process != nil {
+		importCmd.Process.Kill()
+	}
+	
+	return err
 }
 
 func generateDomainCert(domain, certsDir string) (string, string, error) {
