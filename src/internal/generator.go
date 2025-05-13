@@ -1,16 +1,11 @@
 package internal
 
 import (
-	"bufio"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
-	"time"
 	"github.com/joho/godotenv"
 )
 
@@ -46,7 +41,6 @@ func GenerateProject(domain string) error {
 	sharedServicesDir := "shared-services"
 	reverseProxyName := "nginx-reverse-proxy"
 
-	// Insert shared-mysql IP at the top
 	if mysqlIP != "" {
 		_ = InsertIPMappingAtTop(ipmapPath, "shared-mysql", mysqlIP)
 	}
@@ -116,7 +110,6 @@ func GenerateProject(domain string) error {
 		return err
 	}
 
-	// image/, conf/, logs/, data/
 	for _, dir := range []string{"image", "conf", "logs", "data"} {
 		src := filepath.Join(templateDir, dir)
 		dst := filepath.Join(projectDir, dir)
@@ -177,7 +170,7 @@ func GenerateProject(domain string) error {
 		if err := RenderTemplate(sharedComposeTemplate, sharedComposePath, sharedTemplate); err != nil {
 			return fmt.Errorf("Failed to render shared-services/docker-compose.yml: %w", err)
 		}
-		
+
 		fmt.Println("Generated shared-services/docker-compose.yml")
 	}
 
@@ -207,7 +200,7 @@ func GenerateProject(domain string) error {
 		); err != nil {
 			return err
 		}
-		
+
 		fmt.Println("Created reverse proxy config:", siteConf)
 	}
 
@@ -249,267 +242,4 @@ func GenerateProject(domain string) error {
 	}
 
 	return nil
-}
-
-func InsertIPMappingAtTop(filePath, key, ip string) error {
-	entry := fmt.Sprintf("%s=%s", key, ip)
-
-	content, err := os.ReadFile(filePath)
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-
-	lines := strings.Split(string(content), "\n")
-
-	var filtered []string
-	for _, line := range lines {
-		if !strings.HasPrefix(line, key+"=") && strings.TrimSpace(line) != "" {
-			filtered = append(filtered, line)
-		}
-	}
-
-	final := append([]string{entry}, filtered...)
-	return os.WriteFile(filePath, []byte(strings.Join(final, "\n")+"\n"), 0644)
-}
-
-func ExtractIPKeysFromTemplate(path string) ([]string, error) {
-	content, err := os.ReadFile(path)
-
-	if err != nil {
-		return nil, err
-	}
-
-	regex := regexp.MustCompile(`{{\s*index\s+\.IPsByService\s+"([^"]+)"\s*}}`)
-	matches := regex.FindAllStringSubmatch(string(content), -1)
-
-	set := make(map[string]bool)
-	for _, m := range matches {
-		set[m[1]] = true
-	}
-
-	keys := make([]string, 0, len(set))
-
-	for k := range set {
-		keys = append(keys, k)
-	}
-
-	sort.Strings(keys)
-	return keys, nil
-}
-
-func CopyDir(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-
-		target := filepath.Join(dst, rel)
-		if info.IsDir() {
-			return os.MkdirAll(target, info.Mode())
-		}
-
-		srcFile, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-
-		defer srcFile.Close()
-		dstFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, info.Mode())
-		if err != nil {
-			return err
-		}
-
-		defer dstFile.Close()
-		_, err = io.Copy(dstFile, srcFile)
-		return err
-	})
-}
-
-func DeleteProject(domain string) {
-	sharedServicesDir := "shared-services"
-	
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Printf("Are you sure you want to delete domain '%s'? [y/N]: ", domain)
-	answer, _ := reader.ReadString('\n')
-	answer = strings.ToLower(strings.TrimSpace(answer))
-	if answer != "y" {
-		fmt.Println("Aborted.")
-		return
-	}
-
-	projectPath := filepath.Join("domains", domain)
-	composeFile := filepath.Join(projectPath, "docker-compose.yml")
-
-	if _, err := os.Stat(composeFile); err == nil {
-		fmt.Println("Stopping containers for", domain, "...")
-		stopCmd := exec.Command("docker", "compose", "down")
-		stopCmd.Dir = projectPath
-		stopCmd.Stdout = os.Stdout
-		stopCmd.Stderr = os.Stderr
-		if err := stopCmd.Run(); err != nil {
-			fmt.Println("Warning: failed to stop containers:", err)
-		}
-	}
-
-	err := os.RemoveAll(projectPath)
-	if err != nil {
-		fmt.Println("Remove Domain failed, retrying with sudo rm -rf")
-
-		cmd := exec.Command("sudo", "rm", "-rf", projectPath)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		if err := cmd.Run(); err != nil {
-			fmt.Println("Hard delete failed (sudo):", err)
-		} else {
-			fmt.Println("Deleted folder with sudo rm -rf:", projectPath)
-		}
-	} else {
-		fmt.Println("Deleted domain folder:", projectPath)
-	}
-
-	certDir := filepath.Join("shared-services", "certs", domain)
-	if err := os.RemoveAll(certDir); err == nil {
-		fmt.Println("Deleted domain certs folder:", certDir)
-	} else {
-		fmt.Println("Failed to delete cert folder:", err)
-	}
-
-	checkCmd := exec.Command("powershell.exe", "-Command",
-	fmt.Sprintf(`certutil -store Root ^| Select-String "%s"`, domain))
-
-	output, err := checkCmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("Warning: failed to check Windows cert store: %v\n", err)
-	} else if strings.Contains(string(output), domain) {
-		fmt.Println("Removing domain cert from Windows Root store...")
-
-		delCmd := exec.Command("powershell.exe", "-Command",
-			fmt.Sprintf(`Start-Process powershell -Verb runAs -ArgumentList 'certutil -delstore Root "%s"'`, domain))
-		delCmd.Stdin = os.Stdin
-		delCmd.Stdout = os.Stdout
-		delCmd.Stderr = os.Stderr
-
-		if err := delCmd.Run(); err != nil {
-			fmt.Println("Failed to remove trusted cert:", err)
-		} else {
-			fmt.Println("Removed domain cert from Windows Root store.")
-		}
-	} else {
-		fmt.Println("Domain cert not found in Windows Root store — skipping removal.")
-	}
-
-	ipmap := ".ipmap.env"
-	lines, err := os.ReadFile(ipmap)
-	if err == nil {
-		var kept []string
-		for _, line := range strings.Split(string(lines), "\n") {
-			if !strings.HasPrefix(line, domain+"=") && !strings.HasPrefix(line, domain+"_") {
-				kept = append(kept, line)
-			}
-		}
-		os.WriteFile(ipmap, []byte(strings.Join(kept, "\n")), 0644)
-		fmt.Println("Updated:", ipmap)
-	}
-
-	sitePath := filepath.Join(sharedServicesDir, "sites", domain+".conf")
-	if err := os.Remove(sitePath); err == nil {
-		fmt.Println("Removed reverse proxy config:", sitePath)
-	}
-
-	hosts := "/mnt/c/Windows/System32/drivers/etc/hosts"
-	hfile, err := os.ReadFile(hosts)
-	if err == nil {
-		var out []string
-		for _, line := range strings.Split(string(hfile), "\n") {
-			if !strings.Contains(line, domain) {
-				out = append(out, line)
-			}
-		}
-		os.WriteFile(hosts, []byte(strings.Join(out, "\n")), 0644)
-		fmt.Println("Updated Windows hosts file.")
-	}
-
-	fmt.Println("Domain", domain, "was successfully deleted.")
-}
-
-func runDockerComposeUp(dir string) error {
-	cmd := exec.Command("docker", "compose", "up", "-d")
-	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-func waitForMySQL(container, rootPass string) error {
-	for i := 1; i <= 30; i++ {
-		cmd := exec.Command("docker", "exec", container,
-			"mysql", "-uroot", fmt.Sprintf("-p%s", rootPass),
-			"-e", "SELECT 1;")
-
-		if err := cmd.Run(); err == nil {
-			fmt.Println("MySQL is ready.")
-			return nil
-		}
-
-		fmt.Printf("Waiting for MySQL... (%d/30)\n", i)
-		time.Sleep(2 * time.Second)
-	}
-	return fmt.Errorf("MySQL is not responding in container: %s", container)
-}
-
-func grantAllPrivileges(container, rootPass, user string) error {
-	sql := fmt.Sprintf(`GRANT ALL PRIVILEGES ON *.* TO '%s'@'%%' WITH GRANT OPTION;`, user)
-	cmd := exec.Command("docker", "exec", "-i", container, "mysql", "-uroot", fmt.Sprintf("-p%s", rootPass), "-e", sql)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-func updateWindowsHosts(domain, path string) error {
-	hostsEntry := fmt.Sprintf("127.0.0.1 %s", domain)
-
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return err
-	}
-
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		if strings.Contains(scanner.Text(), domain) {
-			fmt.Println("Hosts entry already exists.")
-			return nil
-		}
-	}
-
-	if _, err := file.WriteString("\n" + hostsEntry + "\n"); err != nil {
-		return err
-	}
-
-	fmt.Println("Domain added to Windows hosts file.")
-	return nil
-}
-
-func copy(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, in)
-	return err
 }
