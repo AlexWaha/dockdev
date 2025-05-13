@@ -91,6 +91,22 @@ func GenerateProject(domain string) error {
 		Domain: domain, Prefix: prefix, NetworkName: network, IPsByService: ipMap,
 	}
 
+	certsDir := filepath.Join("shared-services", "certs")
+	if err := ensureRootCA(certsDir); err != nil {
+		return fmt.Errorf("SSL rootCA failed: %w", err)
+	}
+
+	crtPath, keyPath, err := generateDomainCert(domain, certsDir)
+	if err != nil {
+		return fmt.Errorf("Domain SSL generation failed: %w", err)
+	}
+
+	// conf/nginx/ssl
+	sslDstDir := filepath.Join(projectDir, "conf", "nginx", "ssl")
+	os.MkdirAll(sslDstDir, 0755)
+	copy(crtPath, filepath.Join(sslDstDir, "cert.crt"))
+	copy(keyPath, filepath.Join(sslDstDir, "cert.key"))
+
 	// docker-compose.yml
 	if err := RenderTemplate(
 		filepath.Join(templateDir, "docker-compose.yml.tmpl"),
@@ -357,6 +373,37 @@ func DeleteProject(domain string) {
 		fmt.Println("Deleted domain folder:", projectPath)
 	}
 
+	certDir := filepath.Join("shared-services", "certs", domain)
+	if err := os.RemoveAll(certDir); err == nil {
+		fmt.Println("Deleted domain certs folder:", certDir)
+	} else {
+		fmt.Println("Failed to delete cert folder:", err)
+	}
+
+	checkCmd := exec.Command("powershell.exe", "-Command",
+	fmt.Sprintf(`certutil -store Root ^| Select-String "%s"`, domain))
+
+	output, err := checkCmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("Warning: failed to check Windows cert store: %v\n", err)
+	} else if strings.Contains(string(output), domain) {
+		fmt.Println("Removing domain cert from Windows Root store...")
+
+		delCmd := exec.Command("powershell.exe", "-Command",
+			fmt.Sprintf(`Start-Process powershell -Verb runAs -ArgumentList 'certutil -delstore Root "%s"'`, domain))
+		delCmd.Stdin = os.Stdin
+		delCmd.Stdout = os.Stdout
+		delCmd.Stderr = os.Stderr
+
+		if err := delCmd.Run(); err != nil {
+			fmt.Println("Failed to remove trusted cert:", err)
+		} else {
+			fmt.Println("Removed domain cert from Windows Root store.")
+		}
+	} else {
+		fmt.Println("Domain cert not found in Windows Root store — skipping removal.")
+	}
+
 	ipmap := ".ipmap.env"
 	lines, err := os.ReadFile(ipmap)
 	if err == nil {
@@ -448,4 +495,21 @@ func updateWindowsHosts(domain, path string) error {
 
 	fmt.Println("Domain added to Windows hosts file.")
 	return nil
+}
+
+func copy(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	return err
 }
