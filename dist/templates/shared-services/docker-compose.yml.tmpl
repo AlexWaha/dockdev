@@ -3,10 +3,12 @@ services:
     image: nginx:alpine
     container_name: nginx-reverse-proxy
     ports:
+      - "443:443"
       - "80:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./sites:/etc/nginx/sites:ro
+      - ./certs:/etc/nginx/ssl:ro
       - ./logs/nginx:/var/log/nginx
     networks:
       {{.NetworkName}}:

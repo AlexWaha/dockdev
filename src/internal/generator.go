@@ -1,16 +1,10 @@
 package internal
 
 import (
-	"bufio"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
-	"time"
 	"github.com/joho/godotenv"
 )
 
@@ -19,6 +13,7 @@ type TemplateData struct {
 	Prefix       string
 	NetworkName  string
 	IPsByService map[string]string
+	UseSSL       bool
 }
 
 type SharedTemplateData struct {
@@ -30,40 +25,49 @@ type SharedTemplateData struct {
 	MySQLPassword      string
 }
 
-func GenerateProject(domain string) error {
+// GenerateProject creates a new project with the given domain name
+// The useSSL parameter controls whether SSL is enabled for the project
+// Currently, SSL is required for the application to work correctly
+func GenerateProject(domain string, useSSL ...bool) error {
+	// Ensure Docker is running before proceeding
+	if err := EnsureDockerRunning(); err != nil {
+		return fmt.Errorf("Docker check failed: %w", err)
+	}
+
+	enableSSL := SSLEnabled
+
+	// If useSSL parameter is provided, use it
+	if len(useSSL) > 0 {
+		enableSSL = useSSL[0]
+	}
+
 	if err := godotenv.Load(".env"); err != nil {
 		return fmt.Errorf("error loading .env file: %w", err)
 	}
 
-	network := os.Getenv("NETWORK_NAME")
-	baseIP := os.Getenv("PROJECT_START_IP")
-	mysqlIP := os.Getenv("SHARED_MYSQL_IP")
-	ipmapPath := ".ipmap.env"
-	templateDir := "templates"
-	projectDir := filepath.Join("domains", domain)
+	network := os.Getenv(EnvNetworkName)
+	baseIP := os.Getenv(EnvProjectStartIP)
+	mysqlIP := os.Getenv(EnvSharedMySQLIP)
+	projectDir := filepath.Join(ProjectDirPrefix, domain)
 	prefix := strings.Split(domain, ".")[0]
-	hostsPath := "/mnt/c/Windows/System32/drivers/etc/hosts"
-	sharedServicesDir := "shared-services"
-	reverseProxyName := "nginx-reverse-proxy"
 
-	// Insert shared-mysql IP at the top
 	if mysqlIP != "" {
-		_ = InsertIPMappingAtTop(ipmapPath, "shared-mysql", mysqlIP)
+		_ = InsertIPMappingAtTop(IPMapPath, "shared-mysql", mysqlIP)
 	}
 
 	if _, err := os.Stat(projectDir); !os.IsNotExist(err) {
 		return fmt.Errorf("Project already exists: %s", projectDir)
 	}
-	if err := os.MkdirAll(projectDir, 0755); err != nil {
-		return err
+	if err := CreateDirIfNotExist(projectDir); err != nil {
+		return fmt.Errorf("failed to create project directory: %w", err)
 	}
 
-	usedIPs, err := LoadUsedIPs(ipmapPath)
+	usedIPs, err := LoadUsedIPs(IPMapPath)
 	if err != nil {
 		return err
 	}
 
-	ipKeys, err := ExtractIPKeysFromTemplate(filepath.Join(templateDir, "docker-compose.yml.tmpl"))
+	ipKeys, err := ExtractIPKeysFromTemplate(filepath.Join(TemplateDir, DockerComposeFile+".tmpl"))
 	if err != nil {
 		return err
 	}
@@ -82,134 +86,153 @@ func GenerateProject(domain string) error {
 		if key != "main" {
 			entry += "_" + key
 		}
-		if err := AppendIPMapping(ipmapPath, entry, ip); err != nil {
+		if err := AppendIPMapping(IPMapPath, entry, ip); err != nil {
 			return err
 		}
 	}
 
 	data := TemplateData{
-		Domain: domain, Prefix: prefix, NetworkName: network, IPsByService: ipMap,
+		Domain: domain,
+		Prefix: prefix,
+		NetworkName: network,
+		IPsByService: ipMap,
+		UseSSL: enableSSL,
 	}
 
-	// docker-compose.yml
+	if enableSSL {
+		if err := ensureRootCA(CertsDir); err != nil {
+			return fmt.Errorf("SSL rootCA failed: %w", err)
+		}
+
+		crtPath, keyPath, err := generateDomainCert(domain, CertsDir)
+		if err != nil {
+			return fmt.Errorf("Domain SSL generation failed: %w", err)
+		}
+
+		// Copy certificates to project's nginx ssl directory
+		sslDstDir := filepath.Join(projectDir, "conf", "nginx", "ssl")
+		if err := CopyCertificates(crtPath, keyPath, sslDstDir); err != nil {
+			return err
+		}
+	}
+
+	// Render docker-compose.yml from template
 	if err := RenderTemplate(
-		filepath.Join(templateDir, "docker-compose.yml.tmpl"),
-		filepath.Join(projectDir, "docker-compose.yml"),
+		filepath.Join(TemplateDir, DockerComposeFile+".tmpl"),
+		filepath.Join(projectDir, DockerComposeFile),
 		data,
 	); err != nil {
 		return err
 	}
 
-	// image/, conf/, logs/, data/
-	for _, dir := range []string{"image", "conf", "logs", "data"} {
-		src := filepath.Join(templateDir, dir)
-		dst := filepath.Join(projectDir, dir)
-		if _, err := os.Stat(src); err == nil {
-			if err := CopyDir(src, dst); err != nil {
-				return fmt.Errorf("Failed to copy %s: %w", dir, err)
-			}
-		}
-	}
-
-	// conf/nginx/default.conf
-	confDir := filepath.Join(projectDir, "conf", "nginx")
-	if err := os.MkdirAll(confDir, 0755); err != nil {
+	// Copy all required directories from template to project
+	if err := CopyTemplatedDirectories(TemplateDir, projectDir, ProjectFolders); err != nil {
 		return err
 	}
 
+	// Create and render nginx config
+	confDir := filepath.Join(projectDir, "conf", "nginx")
+	if err := CreateDirIfNotExist(confDir); err != nil {
+		return fmt.Errorf("failed to create nginx config directory: %w", err)
+	}
+
 	if err := RenderTemplate(
-		filepath.Join(templateDir, "nginx.conf.tmpl"),
+		filepath.Join(TemplateDir, "nginx.conf.tmpl"),
 		filepath.Join(confDir, "default.conf"),
 		data,
 	); err != nil {
 		return err
 	}
 
-	// app/index.html
+	// Create and render app/index.html
 	appDstDir := filepath.Join(projectDir, "app")
-	if err := os.MkdirAll(appDstDir, 0755); err != nil {
-		return err
+	if err := CreateDirIfNotExist(appDstDir); err != nil {
+		return fmt.Errorf("failed to create app directory: %w", err)
 	}
 
 	if err := RenderTemplate(
-		filepath.Join(templateDir, "app", "index.html"),
+		filepath.Join(TemplateDir, "app", "index.html"),
 		filepath.Join(appDstDir, "index.html"),
 		data,
 	); err != nil {
 		return err
 	}
 
-	// shared-services/sites/domain.conf
-	sitesDir := filepath.Join(sharedServicesDir, "sites")
-	if err := os.MkdirAll(sitesDir, 0755); err != nil {
-		return err
+	// Create and configure shared services
+	sitesDir := filepath.Join(SharedServicesDir, SitesDir)
+	if err := CreateDirIfNotExist(sitesDir); err != nil {
+		return fmt.Errorf("failed to create sites directory: %w", err)
 	}
 
 	// Generate shared-services/docker-compose.yml if it doesn't exist
-	sharedComposeTemplate := filepath.Join(templateDir, sharedServicesDir, "docker-compose.yml.tmpl")
-	sharedComposePath := filepath.Join(sharedServicesDir, "docker-compose.yml")
+	sharedComposeTemplate := filepath.Join(TemplateDir, SharedServicesDir, DockerComposeFile+".tmpl")
+	sharedComposePath := filepath.Join(SharedServicesDir, DockerComposeFile)
 	if _, err := os.Stat(sharedComposePath); os.IsNotExist(err) {
 		sharedTemplate := SharedTemplateData{
 			NetworkName:        network,
-			ReverseProxyIP:     os.Getenv("REVERSE_PROXY_IP"),
-			SharedMySQLIP:      os.Getenv("SHARED_MYSQL_IP"),
-			MySQLRootPassword:  os.Getenv("MYSQL_ROOT_PASSWORD"),
-			MySQLUser:          os.Getenv("MYSQL_USER"),
-			MySQLPassword:      os.Getenv("MYSQL_PASSWORD"),
+			ReverseProxyIP:     os.Getenv(EnvReverseProxyIP),
+			SharedMySQLIP:      os.Getenv(EnvSharedMySQLIP),
+			MySQLRootPassword:  os.Getenv(EnvMySQLRootPassword),
+			MySQLUser:          os.Getenv(EnvMySQLUser),
+			MySQLPassword:      os.Getenv(EnvMySQLPassword),
 		}
 
 		if err := RenderTemplate(sharedComposeTemplate, sharedComposePath, sharedTemplate); err != nil {
-			return fmt.Errorf("Failed to render shared-services/docker-compose.yml: %w", err)
+			return fmt.Errorf("Failed to render %s: %w", filepath.Join(SharedServicesDir, DockerComposeFile), err)
 		}
-		
-		fmt.Println("Generated shared-services/docker-compose.yml")
+
+		fmt.Println("Generated " + filepath.Join(SharedServicesDir, DockerComposeFile))
 	}
 
 	// Render shared-services/nginx.conf
-	nginxConfTemplate := filepath.Join(templateDir, sharedServicesDir, "nginx.conf.tmpl")
-	nginxConfDest := filepath.Join(sharedServicesDir, "nginx.conf")
+	nginxConfTemplate := filepath.Join(TemplateDir, SharedServicesDir, NginxConfFileName+".tmpl")
+	nginxConfDest := filepath.Join(SharedServicesDir, NginxConfFileName)
 	if err := RenderTemplate(nginxConfTemplate, nginxConfDest, data); err != nil {
 		return fmt.Errorf("Failed to render nginx.conf: %w", err)
 	}
 	fmt.Println("Generated reverse proxy nginx.conf")
 
 	// Copy shared-services/image if it exists
-	sharedImageSrc := filepath.Join(templateDir, sharedServicesDir, "image")
-	sharedImageDst := filepath.Join(sharedServicesDir, "image")
+	sharedImageSrc := filepath.Join(TemplateDir, SharedServicesDir, "image")
+	sharedImageDst := filepath.Join(SharedServicesDir, "image")
 	if _, err := os.Stat(sharedImageSrc); err == nil {
 		if err := CopyDir(sharedImageSrc, sharedImageDst); err != nil {
 			return fmt.Errorf("Failed to copy shared-services image: %w", err)
 		}
 	}
 
-	siteConf := filepath.Join(sitesDir, domain+".conf")
-	if _, err := os.Stat(siteConf); os.IsNotExist(err) {
-		if err := RenderTemplate(
-			filepath.Join(templateDir, "site.conf.tmpl"),
-			siteConf,
-			data,
-		); err != nil {
-			return err
-		}
-		
-		fmt.Println("Created reverse proxy config:", siteConf)
-	}
+    // Create site configuration
+    siteConf := filepath.Join(sitesDir, domain+".conf")
+
+    if _, err := os.Stat(siteConf); os.IsNotExist(err) {
+        tmpl := "site.conf.tmpl"
+        if enableSSL {
+            tmpl = "site-ssl.conf.tmpl"
+        }
+
+        if err := RenderTemplate(filepath.Join(TemplateDir, tmpl), siteConf, data); err != nil {
+            return err
+        }
+
+        fmt.Printf("Created reverse proxy %s config: %s\n",
+            map[bool]string{true: "SSL", false: "no-SSL"}[enableSSL], siteConf)
+    }
 
 	fmt.Println("Starting shared-services...")
-	if err := runDockerComposeUp(sharedServicesDir); err != nil {
+	if err := runDockerComposeUp(SharedServicesDir); err != nil {
 		return err
 	}
 
-	root := os.Getenv("MYSQL_ROOT_PASSWORD")
-	user := os.Getenv("MYSQL_USER")
+	root := os.Getenv(EnvMySQLRootPassword)
+	user := os.Getenv(EnvMySQLUser)
 
 	fmt.Println("Waiting for MySQL to become ready...")
-	if err := waitForMySQL("shared_mysql", root); err != nil {
+	if err := waitForMySQL(SharedMySQLName, root); err != nil {
 		return err
 	}
 
 	fmt.Println("Granting privileges to user...")
-	if err := grantAllPrivileges("shared_mysql", root, user); err != nil {
+	if err := grantAllPrivileges(SharedMySQLName, root, user); err != nil {
 		return fmt.Errorf("Failed to grant privileges: %w", err)
 	}
 
@@ -218,234 +241,33 @@ func GenerateProject(domain string) error {
 		return err
 	}
 
-	fmt.Println("Reloading reverse proxy config...")
-	err = exec.Command("docker", "exec", reverseProxyName, "nginx", "-s", "reload").Run()
-	if err != nil {
-		fmt.Println("Reload failed, restarting container...")
-		err = exec.Command("docker", "restart", reverseProxyName).Run()
-		if err != nil {
-			return fmt.Errorf("Failed to reload or restart reverse proxy: %w", err)
-		}
-	}
-
-	if err := updateWindowsHosts(domain, hostsPath); err != nil {
+	// Reload or restart the Nginx reverse proxy
+	if err := restartNginxReverseProxy(); err != nil {
 		return err
 	}
 
-	return nil
-}
-
-func InsertIPMappingAtTop(filePath, key, ip string) error {
-	entry := fmt.Sprintf("%s=%s", key, ip)
-
-	content, err := os.ReadFile(filePath)
-	if err != nil && !os.IsNotExist(err) {
+	if err := updateWindowsHosts(domain, WindowsHostsPath); err != nil {
 		return err
 	}
 
-	lines := strings.Split(string(content), "\n")
+	// Display project information
+	PrintSectionDivider("PROJECT CREATED SUCCESSFULLY")
+	fmt.Println(Success("Your new development environment is ready!"))
 
-	var filtered []string
-	for _, line := range lines {
-		if !strings.HasPrefix(line, key+"=") && strings.TrimSpace(line) != "" {
-			filtered = append(filtered, line)
-		}
-	}
+	projectURL := GetProjectURL(domain)
+	fmt.Println(Info("\nYou can access your project at:"), Bold(Highlight(projectURL)))
 
-	final := append([]string{entry}, filtered...)
-	return os.WriteFile(filePath, []byte(strings.Join(final, "\n")+"\n"), 0644)
-}
-
-func ExtractIPKeysFromTemplate(path string) ([]string, error) {
-	content, err := os.ReadFile(path)
-
-	if err != nil {
-		return nil, err
-	}
-
-	regex := regexp.MustCompile(`{{\s*index\s+\.IPsByService\s+"([^"]+)"\s*}}`)
-	matches := regex.FindAllStringSubmatch(string(content), -1)
-
-	set := make(map[string]bool)
-	for _, m := range matches {
-		set[m[1]] = true
-	}
-
-	keys := make([]string, 0, len(set))
-
-	for k := range set {
-		keys = append(keys, k)
-	}
-
-	sort.Strings(keys)
-	return keys, nil
-}
-
-func CopyDir(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-
-		target := filepath.Join(dst, rel)
-		if info.IsDir() {
-			return os.MkdirAll(target, info.Mode())
-		}
-
-		srcFile, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-
-		defer srcFile.Close()
-		dstFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, info.Mode())
-		if err != nil {
-			return err
-		}
-
-		defer dstFile.Close()
-		_, err = io.Copy(dstFile, srcFile)
-		return err
-	})
-}
-
-func DeleteProject(domain string) {
-	sharedServicesDir := "shared-services"
-	
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Printf("Are you sure you want to delete domain '%s'? [y/N]: ", domain)
-	answer, _ := reader.ReadString('\n')
-	answer = strings.ToLower(strings.TrimSpace(answer))
-	if answer != "y" {
-		fmt.Println("Aborted.")
-		return
-	}
-
-	projectPath := filepath.Join("domains", domain)
-	composeFile := filepath.Join(projectPath, "docker-compose.yml")
-
-	if _, err := os.Stat(composeFile); err == nil {
-		fmt.Println("Stopping containers for", domain, "...")
-		stopCmd := exec.Command("docker", "compose", "down")
-		stopCmd.Dir = projectPath
-		stopCmd.Stdout = os.Stdout
-		stopCmd.Stderr = os.Stderr
-		if err := stopCmd.Run(); err != nil {
-			fmt.Println("Warning: failed to stop containers:", err)
-		}
-	}
-
-	err := os.RemoveAll(projectPath)
-	if err != nil {
-		fmt.Println("Remove Domain failed, retrying with sudo rm -rf")
-
-		cmd := exec.Command("sudo", "rm", "-rf", projectPath)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		if err := cmd.Run(); err != nil {
-			fmt.Println("Hard delete failed (sudo):", err)
+	// Ask to open in browser if in terminal mode
+	if IsTerminal() {
+		if YesNoPrompt("Would you like to open the project in your browser now?", true) {
+			if err := OpenBrowser(projectURL); err != nil {
+				fmt.Println(Warning("Could not open browser automatically."))
+				fmt.Println(Info("Please open this URL manually:"), Highlight(projectURL))
+			}
 		} else {
-			fmt.Println("Deleted folder with sudo rm -rf:", projectPath)
-		}
-	} else {
-		fmt.Println("Deleted domain folder:", projectPath)
-	}
-
-	ipmap := ".ipmap.env"
-	lines, err := os.ReadFile(ipmap)
-	if err == nil {
-		var kept []string
-		for _, line := range strings.Split(string(lines), "\n") {
-			if !strings.HasPrefix(line, domain+"=") && !strings.HasPrefix(line, domain+"_") {
-				kept = append(kept, line)
-			}
-		}
-		os.WriteFile(ipmap, []byte(strings.Join(kept, "\n")), 0644)
-		fmt.Println("Updated:", ipmap)
-	}
-
-	sitePath := filepath.Join(sharedServicesDir, "sites", domain+".conf")
-	if err := os.Remove(sitePath); err == nil {
-		fmt.Println("Removed reverse proxy config:", sitePath)
-	}
-
-	hosts := "/mnt/c/Windows/System32/drivers/etc/hosts"
-	hfile, err := os.ReadFile(hosts)
-	if err == nil {
-		var out []string
-		for _, line := range strings.Split(string(hfile), "\n") {
-			if !strings.Contains(line, domain) {
-				out = append(out, line)
-			}
-		}
-		os.WriteFile(hosts, []byte(strings.Join(out, "\n")), 0644)
-		fmt.Println("Updated Windows hosts file.")
-	}
-
-	fmt.Println("Domain", domain, "was successfully deleted.")
-}
-
-func runDockerComposeUp(dir string) error {
-	cmd := exec.Command("docker", "compose", "up", "-d")
-	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-func waitForMySQL(container, rootPass string) error {
-	for i := 1; i <= 30; i++ {
-		cmd := exec.Command("docker", "exec", container,
-			"mysql", "-uroot", fmt.Sprintf("-p%s", rootPass),
-			"-e", "SELECT 1;")
-
-		if err := cmd.Run(); err == nil {
-			fmt.Println("MySQL is ready.")
-			return nil
-		}
-
-		fmt.Printf("Waiting for MySQL... (%d/30)\n", i)
-		time.Sleep(2 * time.Second)
-	}
-	return fmt.Errorf("MySQL is not responding in container: %s", container)
-}
-
-func grantAllPrivileges(container, rootPass, user string) error {
-	sql := fmt.Sprintf(`GRANT ALL PRIVILEGES ON *.* TO '%s'@'%%' WITH GRANT OPTION;`, user)
-	cmd := exec.Command("docker", "exec", "-i", container, "mysql", "-uroot", fmt.Sprintf("-p%s", rootPass), "-e", sql)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-func updateWindowsHosts(domain, path string) error {
-	hostsEntry := fmt.Sprintf("127.0.0.1 %s", domain)
-
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return err
-	}
-
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		if strings.Contains(scanner.Text(), domain) {
-			fmt.Println("Hosts entry already exists.")
-			return nil
+			fmt.Println(Info("You can open this URL in your browser when ready:"), Highlight(projectURL))
 		}
 	}
 
-	if _, err := file.WriteString("\n" + hostsEntry + "\n"); err != nil {
-		return err
-	}
-
-	fmt.Println("Domain added to Windows hosts file.")
 	return nil
 }
