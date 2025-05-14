@@ -207,7 +207,6 @@ This means you can develop with:
 The tool uses an `.env` file for configuration:
 
 ```
-DOCKDEV_FOLDER=dockdev
 NETWORK_NAME=local_net
 SUBNET=10.0.100.0/24
 REVERSE_PROXY_IP=10.0.100.2
