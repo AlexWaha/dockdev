@@ -1,0 +1,8 @@
+# IDE/editor settings
+/.idea
+/.vscode
+/.fleet
+/.osp
+
+# macOS system files
+.DS_Store
