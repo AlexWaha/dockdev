@@ -1,17 +1,6 @@
 server {
     listen 80;
     server_name {{.Domain}};
-    return 301 https://$host$request_uri;
-}
-
-server {
-    listen 443 ssl;
-    server_name {{.Domain}};
-
-    ssl_certificate /etc/nginx/ssl/{{.Domain}}/{{.Domain}}.crt;
-    ssl_certificate_key /etc/nginx/ssl/{{.Domain}}/{{.Domain}}.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
 
     location / {
         proxy_pass http://{{.IPsByService.main}}:80;
