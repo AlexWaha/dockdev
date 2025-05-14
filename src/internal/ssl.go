@@ -42,12 +42,12 @@ func ensureRootCA(certsDir string) error {
 	importCmd.Stdout = os.Stdout
 	importCmd.Stderr = os.Stderr
 	err := importCmd.Run()
-	
+
 	// Force garbage collection for PowerShell process
 	if importCmd.Process != nil {
 		importCmd.Process.Kill()
 	}
-	
+
 	return err
 }
 

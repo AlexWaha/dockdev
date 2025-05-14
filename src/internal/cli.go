@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-
 	"golang.org/x/term"
 )
 
@@ -62,18 +61,26 @@ func ShowHelp() {
 	fmt.Println(Bold(ColoredMessage(ColorBlue, "Docker Development Environment Tool")))
 	fmt.Println(ColoredMessage(ColorBlue, "=================================="))
 	fmt.Println(Bold("Usage:"))
-	fmt.Println("  " + ColoredMessage(ColorGreen, "[domain]") + "      - Create a new project with the given domain")
-	fmt.Println("  " + ColoredMessage(ColorRed, "rm [domain]") + "   - Remove an existing project")
-	fmt.Println("  " + ColoredMessage(ColorCyan, "-H, --help") + "    - Show this help message")
+	fmt.Println("  " + ColoredMessage(ColorGreen, "[domain]") + "              - Create a new project with the given domain")
+	fmt.Println("  " + ColoredMessage(ColorGreen, "[domain] --no-ssl") + "     - Create a project without SSL (not recommended)")
+	fmt.Println("  " + ColoredMessage(ColorRed, "rm [domain]") + "           - Remove an existing project")
+	fmt.Println("  " + ColoredMessage(ColorCyan, "-H, --help") + "            - Show this help message")
 	fmt.Println("\n" + Bold("Examples:"))
-	fmt.Println("  " + ColoredMessage(ColorGreen, "myapp.test") + "    - Create a new project with domain myapp.test")
-	fmt.Println("  " + ColoredMessage(ColorRed, "rm myapp.test") + " - Remove the project with domain myapp.test")
+	fmt.Println("  " + ColoredMessage(ColorGreen, "myapp.test") + "            - Create a new project with domain myapp.test")
+	fmt.Println("  " + ColoredMessage(ColorRed, "rm myapp.test") + "         - Remove the project with domain myapp.test")
+
+	fmt.Println("\n" + Bold("Features:"))
+	fmt.Println("  • Interactive project creation and deletion")
+	fmt.Println("  • Automatic SSL certificate generation")
+	fmt.Println("  • Windows hosts file management")
+	fmt.Println("  • Automatic browser opening for new projects")
+	fmt.Println("  • Shared MySQL database for all projects")
 }
 
 // ListExistingProjects returns a list of existing project domains
 func ListExistingProjects() ([]string, error) {
 	var projects []string
-	
+
 	domainsDir := ProjectDirPrefix
 	entries, err := os.ReadDir(domainsDir)
 	if err != nil {
@@ -82,7 +89,7 @@ func ListExistingProjects() ([]string, error) {
 		}
 		return nil, err
 	}
-	
+
 	for _, entry := range entries {
 		if entry.IsDir() {
 			// Check if it's a valid project by looking for docker-compose.yml
@@ -92,7 +99,7 @@ func ListExistingProjects() ([]string, error) {
 			}
 		}
 	}
-	
+
 	return projects, nil
 }
 
@@ -101,17 +108,17 @@ func InteractiveProjectCreation() error {
 	if !IsTerminal() {
 		return fmt.Errorf("cannot run in interactive mode: not a terminal")
 	}
-	
+
 	domain := StringPrompt("Enter project domain (e.g. app.test):")
 	if domain == "" {
 		return fmt.Errorf("domain cannot be empty")
 	}
-	
+
 	PrintDivider()
 	fmt.Println(Bold("PROJECT CONFIGURATION:"))
-	
+
 	useSSL := YesNoPrompt("Do you want to enable SSL for this project?", true)
-	
+
 	if useSSL {
 		fmt.Println(Info("Creating project with SSL enabled..."))
 	} else {
@@ -119,9 +126,11 @@ func InteractiveProjectCreation() error {
 		// Note: Currently SSL is required, but we'll pass the user's preference
 		// to the GenerateProject function which will handle this case
 	}
-	
+
 	PrintDivider()
 	fmt.Println(Bold("GENERATING PROJECT:"))
+
+	// GenerateProject will handle browser opening
 	return GenerateProject(domain, useSSL)
 }
 
@@ -130,25 +139,25 @@ func InteractiveProjectDeletion() error {
 	if !IsTerminal() {
 		return fmt.Errorf("cannot run in interactive mode: not a terminal")
 	}
-	
+
 	projects, err := ListExistingProjects()
 	if err != nil {
 		return fmt.Errorf("failed to list projects: %w", err)
 	}
-	
+
 	if len(projects) == 0 {
 		fmt.Println(Info("No projects found to delete."))
 		return nil
 	}
-	
+
 	PrintDivider()
 	fmt.Println(Bold("AVAILABLE PROJECTS:"))
 	for i, project := range projects {
 		fmt.Printf("%s %s\n", ColoredMessage(ColorGreen, fmt.Sprintf("%d.", i+1)), Bold(project))
 	}
-	
+
 	projectIndex := -1
-	
+
 	for projectIndex < 0 || projectIndex >= len(projects) {
 		indexStr := StringPrompt(fmt.Sprintf("Enter project number to delete (1-%d):", len(projects)))
 		var index int
@@ -159,17 +168,17 @@ func InteractiveProjectDeletion() error {
 		}
 		projectIndex = index - 1
 	}
-	
+
 	domain := projects[projectIndex]
 	PrintDivider()
 	fmt.Println(Bold("CONFIRMATION:"))
 	confirm := YesNoPrompt(fmt.Sprintf("Are you sure you want to delete '%s'?", Bold(domain)), false)
-	
+
 	if !confirm {
 		fmt.Println(Info("Operation cancelled."))
 		return nil
 	}
-	
+
 	DeleteProject(domain)
 	return nil
 }
@@ -186,15 +195,15 @@ func RunInteractiveMode() error {
 	if !IsTerminal() {
 		return fmt.Errorf("cannot run in interactive mode: not a terminal")
 	}
-	
+
 	for {
 		PrintSectionDivider("DOCKER DEVELOPMENT ENVIRONMENT TOOL")
-		
+
 		projects, err := ListExistingProjects()
 		if err != nil {
 			return fmt.Errorf("failed to list projects: %w", err)
 		}
-		
+
 		// Display existing projects
 		if len(projects) == 0 {
 			fmt.Println(Info("No existing projects found."))
@@ -204,16 +213,16 @@ func RunInteractiveMode() error {
 				fmt.Println("  -", Bold(project))
 			}
 		}
-		
+
 		// Show menu
 		PrintDivider()
 		fmt.Println(Bold("AVAILABLE ACTIONS:"))
 		fmt.Println(ColoredMessage(ColorGreen, "1. Create a new project"))
 		fmt.Println(ColoredMessage(ColorRed, "2. Delete an existing project"))
 		fmt.Println(Gray("3. Exit"))
-		
+
 		option := StringPrompt("Enter your choice (1-3):")
-		
+
 		switch option {
 		case "1":
 			// Create a new project
@@ -225,7 +234,7 @@ func RunInteractiveMode() error {
 			} else {
 				WaitForKeyPress("Project created successfully. Press Enter to continue...")
 			}
-			
+
 		case "2":
 			// Delete an existing project
 			PrintSectionDivider("DELETE EXISTING PROJECT")
@@ -241,16 +250,16 @@ func RunInteractiveMode() error {
 					WaitForKeyPress("Press Enter to continue...")
 				}
 			}
-			
+
 		case "3":
 			// Exit
 			PrintSectionDivider("EXITING APPLICATION")
 			fmt.Println(Gray("Exiting. Goodbye!"))
 			return nil
-			
+
 		default:
 			fmt.Println(Warning("Invalid option. Please choose 1, 2, or 3."))
 			WaitForKeyPress("Press Enter to continue...")
 		}
 	}
-} 
+}

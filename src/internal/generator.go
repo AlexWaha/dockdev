@@ -34,20 +34,11 @@ func GenerateProject(domain string, useSSL ...bool) error {
 		return fmt.Errorf("Docker check failed: %w", err)
 	}
 
-	// Default to SSL enabled
-	enableSSL := true
-	
+	enableSSL := SSLEnabled
+
 	// If useSSL parameter is provided, use it
 	if len(useSSL) > 0 {
 		enableSSL = useSSL[0]
-	}
-	
-	// For now, we require SSL to be enabled
-	if !enableSSL {
-		enableSSL = SSLEnabled
-		if enableSSL {
-			fmt.Println("Warning: SSL is currently required for projects. Your selection to disable SSL was ignored.")
-		}
 	}
 
 	if err := godotenv.Load(".env"); err != nil {
@@ -101,9 +92,9 @@ func GenerateProject(domain string, useSSL ...bool) error {
 	}
 
 	data := TemplateData{
-		Domain: domain, 
-		Prefix: prefix, 
-		NetworkName: network, 
+		Domain: domain,
+		Prefix: prefix,
+		NetworkName: network,
 		IPsByService: ipMap,
 		UseSSL: enableSSL,
 	}
@@ -210,19 +201,22 @@ func GenerateProject(domain string, useSSL ...bool) error {
 		}
 	}
 
-	// Create site configuration
-	siteConf := filepath.Join(sitesDir, domain+".conf")
-	if _, err := os.Stat(siteConf); os.IsNotExist(err) {
-		if err := RenderTemplate(
-			filepath.Join(TemplateDir, "site.conf.tmpl"),
-			siteConf,
-			data,
-		); err != nil {
-			return err
-		}
+    // Create site configuration
+    siteConf := filepath.Join(sitesDir, domain+".conf")
 
-		fmt.Println("Created reverse proxy config:", siteConf)
-	}
+    if _, err := os.Stat(siteConf); os.IsNotExist(err) {
+        tmpl := "site.conf.tmpl"
+        if enableSSL {
+            tmpl = "site-ssl.conf.tmpl"
+        }
+
+        if err := RenderTemplate(filepath.Join(TemplateDir, tmpl), siteConf, data); err != nil {
+            return err
+        }
+
+        fmt.Printf("Created reverse proxy %s config: %s\n",
+            map[bool]string{true: "SSL", false: "no-SSL"}[enableSSL], siteConf)
+    }
 
 	fmt.Println("Starting shared-services...")
 	if err := runDockerComposeUp(SharedServicesDir); err != nil {
@@ -254,6 +248,25 @@ func GenerateProject(domain string, useSSL ...bool) error {
 
 	if err := updateWindowsHosts(domain, WindowsHostsPath); err != nil {
 		return err
+	}
+
+	// Display project information
+	PrintSectionDivider("PROJECT CREATED SUCCESSFULLY")
+	fmt.Println(Success("Your new development environment is ready!"))
+
+	projectURL := GetProjectURL(domain)
+	fmt.Println(Info("\nYou can access your project at:"), Bold(Highlight(projectURL)))
+
+	// Ask to open in browser if in terminal mode
+	if IsTerminal() {
+		if YesNoPrompt("Would you like to open the project in your browser now?", true) {
+			if err := OpenBrowser(projectURL); err != nil {
+				fmt.Println(Warning("Could not open browser automatically."))
+				fmt.Println(Info("Please open this URL manually:"), Highlight(projectURL))
+			}
+		} else {
+			fmt.Println(Info("You can open this URL in your browser when ready:"), Highlight(projectURL))
+		}
 	}
 
 	return nil

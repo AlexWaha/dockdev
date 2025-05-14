@@ -57,9 +57,16 @@ func main() {
 			return
 		}
 
-		// Assume the argument is a domain name
+		// Assume the argument is a domain name - direct project creation
 		internal.PrintSectionDivider("CREATING PROJECT: " + args[1])
-		if err := internal.GenerateProject(args[1]); err != nil {
+		
+		// Parse SSL flag if provided (not normally used from CLI but added for completeness)
+		useSSL := true
+		if len(args) > 2 && args[2] == "--no-ssl" {
+			useSSL = false
+		}
+		
+		if err := internal.GenerateProject(args[1], useSSL); err != nil {
 			fmt.Println(internal.Error("Error:"), err)
 			os.Exit(1)
 		}
